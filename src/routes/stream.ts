@@ -1,9 +1,9 @@
 import type { Request, Response } from 'express';
 import { getTrackStreamInfo } from '../services/deezer.js';
-import { decryptDeezerBuffer, CHUNK_SIZE } from '../services/decrypt.js';
+import { streamAndDecryptDeezer, CHUNK_SIZE } from '../services/decrypt.js';
 
 export async function handleStream(req: Request, res: Response) {
-  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id || '');
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id || '';
   const numericId = String(rawId).replace(/^deezer:/i, '');
   const quality = (req.query.quality as string) || 'lossless';
 
@@ -19,27 +19,27 @@ export async function handleStream(req: Request, res: Response) {
     const rangeHeader = req.headers.range;
 
     if (!rangeHeader) {
-      // 1. Full file request (No Range header)
+      // 1. Full stream request
       const cdnRes = await fetch(cdnUrl);
-      if (!cdnRes.ok) {
+      if (!cdnRes.ok || !cdnRes.body) {
         res.status(cdnRes.status).send(`CDN error: ${cdnRes.statusText}`);
         return;
       }
 
-      const rawBuffer = Buffer.from(await cdnRes.arrayBuffer());
-      const decrypted = decryptDeezerBuffer(rawBuffer, numericId, 0);
+      const totalSize = cdnRes.headers.get('content-length') || '*';
 
       res.writeHead(200, {
         'Content-Type': contentType,
-        'Content-Length': decrypted.length,
+        ...(totalSize !== '*' ? { 'Content-Length': totalSize } : {}),
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'public, max-age=3600',
+        'Cache-Control': 'public, max-age=86400',
       });
-      res.end(decrypted);
+
+      await streamAndDecryptDeezer(cdnRes.body, numericId, 0, 0, undefined, res);
       return;
     }
 
-    // 2. Range request (ExoPlayer seeking / buffering)
+    // 2. HTTP Range request (ExoPlayer seeking and buffer streaming)
     const matches = rangeHeader.match(/bytes=(\d+)-(\d*)/);
     if (!matches) {
       res.status(416).send('Invalid Range header');
@@ -49,7 +49,7 @@ export async function handleStream(req: Request, res: Response) {
     const start = parseInt(matches[1], 10);
     const end = matches[2] ? parseInt(matches[2], 10) : undefined;
 
-    // Align range to 2048-byte chunk boundaries for Blowfish stripe decryption
+    // Align to 2048-byte chunks for Blowfish stripe decryption
     const alignedStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE;
     const alignedEnd =
       typeof end === 'number'
@@ -70,38 +70,40 @@ export async function handleStream(req: Request, res: Response) {
       return;
     }
 
-    const cdnContentRange = cdnRes.headers.get('content-range');
-    let totalFileSize = '*';
-    if (cdnContentRange) {
-      const totalMatch = cdnContentRange.match(/\/(\d+|\*)/);
-      if (totalMatch) {
-        totalFileSize = totalMatch[1];
-      }
+    if (!cdnRes.body) {
+      res.status(500).send('CDN stream body is empty');
+      return;
     }
 
-    const rawBuffer = Buffer.from(await cdnRes.arrayBuffer());
-    const decrypted = decryptDeezerBuffer(rawBuffer, numericId, alignedStart);
+    // Extract total file size from CDN Content-Range header (e.g. bytes 0-1023/22934004)
+    const cdnContentRange = cdnRes.headers.get('content-range') || '';
+    const totalMatch = cdnContentRange.match(/\/(\d+|\*)/);
+    const totalFileSize = totalMatch ? totalMatch[1] : '*';
 
-    // Slice to exact client-requested range
-    const offsetInDecrypted = start - alignedStart;
-    const desiredLength = typeof end === 'number' ? end - start + 1 : undefined;
+    // Calculate response range length
+    const actualEnd =
+      typeof end === 'number'
+        ? end
+        : totalFileSize !== '*'
+          ? parseInt(totalFileSize, 10) - 1
+          : undefined;
 
-    const finalBuffer =
-      typeof desiredLength === 'number'
-        ? decrypted.subarray(offsetInDecrypted, offsetInDecrypted + desiredLength)
-        : decrypted.subarray(offsetInDecrypted);
-
-    const actualEnd = start + finalBuffer.length - 1;
+    const contentLength =
+      typeof actualEnd === 'number' ? actualEnd - start + 1 : undefined;
 
     res.writeHead(206, {
       'Content-Type': contentType,
-      'Content-Range': `bytes ${start}-${actualEnd}/${totalFileSize}`,
-      'Content-Length': finalBuffer.length,
+      'Content-Range': `bytes ${start}-${typeof actualEnd === 'number' ? actualEnd : '*'}/${totalFileSize}`,
+      ...(typeof contentLength === 'number' ? { 'Content-Length': contentLength } : {}),
       'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=86400',
     });
-    res.end(finalBuffer);
+
+    await streamAndDecryptDeezer(cdnRes.body, numericId, alignedStart, start, end, res);
   } catch (error: any) {
-    console.error(`Stream error for ID ${numericId}:`, error?.message || error);
-    res.status(500).send(`Failed to stream track: ${error?.message || error}`);
+    if (!res.headersSent) {
+      console.error(`Stream error for ID ${numericId}:`, error?.message || error);
+      res.status(500).send(`Failed to stream track: ${error?.message || error}`);
+    }
   }
 }

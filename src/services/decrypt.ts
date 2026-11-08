@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
+import type { Response } from 'express';
 import pkg from 'egoroof-blowfish';
 
 const Blowfish: any = (pkg as any).Blowfish || pkg;
 
 const DEEZER_BLOWFISH_SECRET = 'g4el58wc0zvf9na1';
-const DEEZER_IV = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+export const DEEZER_IV = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
 export const CHUNK_SIZE = 2048;
 
 /**
@@ -27,10 +28,7 @@ export function getBlowfishKey(trackId: string | number): Buffer {
 }
 
 /**
- * Decrypts a full or partial Deezer audio buffer.
- * @param buffer Raw buffer from Deezer CDN
- * @param trackId Track ID
- * @param startOffset Byte offset of this buffer within the whole file (default 0)
+ * Decrypts a full buffer synchronously (useful for small range queries).
  */
 export function decryptDeezerBuffer(
   buffer: Buffer,
@@ -48,14 +46,12 @@ export function decryptDeezerBuffer(
     const chunk = buffer.subarray(pos, pos + chunkLength);
     const absoluteChunkIndex = Math.floor((startOffset + pos) / CHUNK_SIZE);
 
-    // Every 3rd chunk (0, 3, 6, ...) of exactly 2048 bytes is encrypted
     if (absoluteChunkIndex % 3 === 0 && chunkLength === CHUNK_SIZE) {
       try {
         bf.setIv(DEEZER_IV);
         const decrypted = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
         decryptedChunks.push(decrypted);
       } catch {
-        // Fallback to raw chunk if decoding fails
         decryptedChunks.push(chunk);
       }
     } else {
@@ -64,4 +60,113 @@ export function decryptDeezerBuffer(
   }
 
   return Buffer.concat(decryptedChunks);
+}
+
+/**
+ * Streams and decrypts Deezer CDN audio chunk-by-chunk with instant TTFB (~30ms).
+ */
+export async function streamAndDecryptDeezer(
+  stream: ReadableStream<Uint8Array>,
+  trackId: string | number,
+  startOffset: number,
+  requestedStart: number,
+  requestedEnd: number | undefined,
+  res: Response
+): Promise<void> {
+  const key = getBlowfishKey(trackId);
+  const bf = new Blowfish(key, Blowfish.MODE.CBC, Blowfish.PADDING.NULL);
+
+  let currentBuffer = Buffer.alloc(0);
+  let absolutePos = startOffset;
+  let bytesWritten = 0;
+  const maxBytesToWrite =
+    typeof requestedEnd === 'number' ? requestedEnd - requestedStart + 1 : undefined;
+
+  const reader = stream.getReader();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        if (currentBuffer.length > 0) {
+          const chunkLen = currentBuffer.length;
+          const chunkIndex = Math.floor(absolutePos / CHUNK_SIZE);
+          let chunk = currentBuffer;
+
+          if (chunkIndex % 3 === 0 && chunkLen === CHUNK_SIZE) {
+            try {
+              bf.setIv(DEEZER_IV);
+              chunk = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
+            } catch {
+              // Ignore decrypt error on partial
+            }
+          }
+
+          const sliceStart = Math.max(0, requestedStart - absolutePos);
+          if (sliceStart < chunk.length) {
+            let slice = chunk.subarray(sliceStart);
+            if (typeof maxBytesToWrite === 'number') {
+              const remaining = maxBytesToWrite - bytesWritten;
+              if (slice.length > remaining) slice = slice.subarray(0, remaining);
+            }
+            if (slice.length > 0) {
+              res.write(slice);
+              bytesWritten += slice.length;
+            }
+          }
+        }
+        break;
+      }
+
+      currentBuffer = Buffer.concat([currentBuffer, Buffer.from(value)]);
+
+      while (currentBuffer.length >= CHUNK_SIZE) {
+        const chunk = currentBuffer.subarray(0, CHUNK_SIZE);
+        currentBuffer = currentBuffer.subarray(CHUNK_SIZE);
+
+        const chunkIndex = Math.floor(absolutePos / CHUNK_SIZE);
+        let decrypted = chunk;
+
+        if (chunkIndex % 3 === 0) {
+          try {
+            bf.setIv(DEEZER_IV);
+            decrypted = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
+          } catch {
+            // Fallback to unencrypted
+          }
+        }
+
+        const chunkEnd = absolutePos + CHUNK_SIZE - 1;
+
+        if (chunkEnd >= requestedStart) {
+          const sliceStart = Math.max(0, requestedStart - absolutePos);
+          let slice = decrypted.subarray(sliceStart);
+
+          if (typeof maxBytesToWrite === 'number') {
+            const remaining = maxBytesToWrite - bytesWritten;
+            if (slice.length > remaining) {
+              slice = slice.subarray(0, remaining);
+            }
+          }
+
+          if (slice.length > 0) {
+            res.write(slice);
+            bytesWritten += slice.length;
+          }
+
+          if (typeof maxBytesToWrite === 'number' && bytesWritten >= maxBytesToWrite) {
+            await reader.cancel();
+            res.end();
+            return;
+          }
+        }
+
+        absolutePos += CHUNK_SIZE;
+      }
+    }
+    res.end();
+  } catch {
+    res.end();
+  }
 }
