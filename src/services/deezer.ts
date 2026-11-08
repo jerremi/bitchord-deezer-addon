@@ -176,7 +176,8 @@ export async function searchTracks(query: string, quality = 'lossless'): Promise
         album: item.ALB_TITLE,
         duration: Math.round(Number(item.DURATION) || 0),
         format: normalizedQuality === 'high' ? 'mp3' : 'flac',
-        artwork,
+        audioQuality: normalizedQuality === 'high' ? 'HIGH' : 'LOSSLESS',
+        artworkURL: artwork,
       };
     });
 

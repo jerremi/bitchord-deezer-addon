@@ -23,7 +23,8 @@ export interface BitChordTrack {
   album: string;
   duration: number; // Duration in seconds (integer)
   format: 'flac' | 'mp3' | 'aac' | 'alac';
-  artwork?: string;
+  audioQuality?: string;
+  artworkURL?: string;
 }
 
 export interface SearchResponse {

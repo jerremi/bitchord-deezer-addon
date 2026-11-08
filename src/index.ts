@@ -3,10 +3,14 @@ import cors from 'cors';
 import { config } from './config.js';
 import { getManifest } from './routes/manifest.js';
 import { handleSearch } from './routes/search.js';
-import { handleStream } from './routes/stream.js';
+import { handleAudio, handleStream } from './routes/stream.js';
 import { handleHealth } from './routes/health.js';
 
 const app = express();
+
+// Behind the Cloudflare tunnel, build absolute audio URLs with the public
+// https origin instead of the internal http one.
+app.set('trust proxy', true);
 
 // Middlewares
 app.use(cors());
@@ -22,6 +26,7 @@ app.use((req, _res, next) => {
 app.get('/manifest.json', getManifest);
 app.get('/search', handleSearch);
 app.get('/stream/:id', handleStream);
+app.get('/audio/:id', handleAudio);
 app.get('/health', handleHealth);
 
 // Addon Status Dashboard (when opened in browser)
@@ -63,6 +68,8 @@ app.get('/', (_req, res) => {
     <ul>
       <li><a href="/manifest.json"><code>GET /manifest.json</code></a> — Addon descriptor</li>
       <li><a href="/search?q=daft+punk"><code>GET /search?q=daft+punk</code></a> — Track search</li>
+      <li><a href="/stream/deezer:3135554"><code>GET /stream/:id</code></a> — Stream info (JSON)</li>
+      <li><a href="/audio/deezer:3135554"><code>GET /audio/:id</code></a> — Decrypted audio stream</li>
       <li><a href="/health"><code>GET /health</code></a> — Health status</li>
     </ul>
   </div>

@@ -3,6 +3,23 @@ import { getTrackStreamInfo } from '../services/deezer.js';
 import { CHUNK_SIZE, streamAndDecryptDeezer } from '../services/decrypt.js';
 
 type ParsedRange = { start: number; end: number } | 'invalid' | null;
+type Quality = 'lossless' | 'high';
+
+interface TrackRequest {
+  numericId: string;
+  quality: Quality;
+}
+
+function parseTrackRequest(req: Request): TrackRequest | null {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id || '';
+  const numericId = String(rawId).replace(/^deezer:/i, '');
+  if (!/^\d+$/.test(numericId)) return null;
+
+  return {
+    numericId,
+    quality: req.query.quality === 'high' ? 'high' : 'lossless',
+  };
+}
 
 /**
  * Parses a single-range `bytes=` header. Multi-range requests are rejected,
@@ -40,18 +57,69 @@ function parseRange(header: string | undefined, fileSize: number): ParsedRange {
   return { start, end };
 }
 
+/**
+ * `GET /stream/{id}` — BitChord addon protocol: JSON describing where the
+ * playable audio is. The app reads the whole response body before parsing, so
+ * this must never serve audio bytes; the audio lives at `/audio/{id}`.
+ */
 export async function handleStream(req: Request, res: Response) {
-  req.socket?.setNoDelay(true);
+  const track = parseTrackRequest(req);
+  if (!track) {
+    res.status(400).json({ error: 'Invalid track ID' });
+    return;
+  }
 
-  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id || '';
-  const numericId = String(rawId).replace(/^deezer:/i, '');
-  const quality = req.query.quality === 'high' ? 'high' : 'lossless';
+  const { numericId, quality } = track;
   const t0 = Date.now();
 
-  if (!/^\d+$/.test(numericId)) {
+  try {
+    const { format } = await getTrackStreamInfo(numericId, quality);
+    const lossless = format.toUpperCase() === 'FLAC';
+    const codec = lossless ? 'flac' : 'mp3';
+    const host = req.get('x-forwarded-host') || req.get('host') || 'localhost';
+    const url = `${req.protocol}://${host}/audio/${numericId}?quality=${quality}`;
+
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      url,
+      format: codec,
+      codec,
+      container: codec,
+      quality: lossless ? 'Lossless' : 'High (320 kbps)',
+      sampleRate: 44100,
+      ...(lossless ? { bitDepth: 16, bitrate: 1_411_000 } : { bitrate: 320_000 }),
+      encrypted: false,
+    });
+
+    console.log(`[STREAM] JSON ${numericId} | ${quality} | ${Date.now() - t0}ms`);
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    console.error(`[STREAM] resolve failed ${numericId} | ${Date.now() - t0}ms | ${message}`);
+
+    if (/no song data|could not find track data/i.test(message)) {
+      res.status(404).json({ error: 'Track not found' });
+    } else {
+      // The reference addon answers configuration problems with HTTP 200 and
+      // an `error` field, which BitChord logs without treating it as a fault.
+      res.status(200).json({ error: message });
+    }
+  }
+}
+
+/**
+ * `GET /audio/{id}` — the actual decrypted audio, progressive and Range-aware.
+ */
+export async function handleAudio(req: Request, res: Response) {
+  req.socket?.setNoDelay(true);
+
+  const track = parseTrackRequest(req);
+  if (!track) {
     res.status(400).send('Invalid track ID');
     return;
   }
+
+  const { numericId, quality } = track;
+  const t0 = Date.now();
 
   try {
     const { url: cdnUrl, format, fileSize } = await getTrackStreamInfo(numericId, quality);
@@ -85,7 +153,7 @@ export async function handleStream(req: Request, res: Response) {
         });
       }
       res.end();
-      console.log(`[STREAM] HEAD ${numericId} | ${Date.now() - t0}ms | ${fileSize} bytes`);
+      console.log(`[AUDIO] HEAD ${numericId} | ${Date.now() - t0}ms | ${fileSize} bytes`);
       return;
     }
 
@@ -93,13 +161,12 @@ export async function handleStream(req: Request, res: Response) {
       // Full file: stream progressively so playback can start immediately.
       const cdnRes = await fetch(cdnUrl);
       if (!cdnRes.ok || !cdnRes.body) {
-        console.error(`[STREAM] CDN full failed ${numericId}: HTTP ${cdnRes.status}`);
+        console.error(`[AUDIO] CDN full failed ${numericId}: HTTP ${cdnRes.status}`);
         res.status(502).send('Upstream stream unavailable');
         return;
       }
 
-      const totalSize =
-        Number(cdnRes.headers.get('content-length')) || fileSize;
+      const totalSize = Number(cdnRes.headers.get('content-length')) || fileSize;
       const totalLength = totalSize > 0 ? totalSize : 0;
 
       res.writeHead(200, {
@@ -110,7 +177,7 @@ export async function handleStream(req: Request, res: Response) {
       });
 
       console.log(
-        `[STREAM] 200 ${numericId} | ${Date.now() - t0}ms | ${totalLength || 'unknown'} bytes`
+        `[AUDIO] 200 ${numericId} | ${Date.now() - t0}ms | ${totalLength || 'unknown'} bytes`
       );
 
       await streamAndDecryptDeezer(
@@ -133,7 +200,7 @@ export async function handleStream(req: Request, res: Response) {
     });
 
     if (!cdnRes.ok && cdnRes.status !== 206) {
-      console.error(`[STREAM] CDN range failed ${numericId}: HTTP ${cdnRes.status}`);
+      console.error(`[AUDIO] CDN range failed ${numericId}: HTTP ${cdnRes.status}`);
       res.status(502).send('Upstream stream unavailable');
       return;
     }
@@ -154,7 +221,7 @@ export async function handleStream(req: Request, res: Response) {
     });
 
     console.log(
-      `[STREAM] 206 ${numericId} | ${Date.now() - t0}ms | ${range.start}-${range.end}/${fileSize}`
+      `[AUDIO] 206 ${numericId} | ${Date.now() - t0}ms | ${range.start}-${range.end}/${fileSize}`
     );
 
     await streamAndDecryptDeezer(
@@ -167,7 +234,7 @@ export async function handleStream(req: Request, res: Response) {
     );
   } catch (error: any) {
     console.error(
-      `[STREAM] ERROR ${numericId} | ${Date.now() - t0}ms | ${error?.message || error}`
+      `[AUDIO] ERROR ${numericId} | ${Date.now() - t0}ms | ${error?.message || error}`
     );
     if (res.headersSent) {
       res.destroy();
