@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import type { BitChordTrack } from '../types.js';
+import { CHUNK_SIZE, decryptDeezerBuffer } from './decrypt.js';
 
 interface DeezerUserData {
   checkForm: string;
@@ -12,6 +13,8 @@ export interface StreamInfo {
   url: string;
   format: string;
   fileSize: number;
+  sampleRate: number;
+  bitDepth: number;
 }
 
 interface StreamCacheEntry extends StreamInfo {
@@ -21,6 +24,7 @@ interface StreamCacheEntry extends StreamInfo {
 // Deezer exposes the exact encrypted file size in song.getData, so resolving a
 // stream URL never needs an extra HEAD round-trip.
 const FILE_SIZE_FIELDS: Record<string, string> = {
+  FLAC_24: 'FILESIZE_FLAC_24',
   FLAC: 'FILESIZE_FLAC',
   MP3_320: 'FILESIZE_MP3_320',
   MP3_256: 'FILESIZE_MP3_256',
@@ -176,7 +180,12 @@ export async function searchTracks(query: string, quality = 'lossless'): Promise
         album: item.ALB_TITLE,
         duration: Math.round(Number(item.DURATION) || 0),
         format: normalizedQuality === 'high' ? 'mp3' : 'flac',
-        audioQuality: normalizedQuality === 'high' ? 'HIGH' : 'LOSSLESS',
+        audioQuality:
+          normalizedQuality === 'high'
+            ? 'HIGH'
+            : Number(item.FILESIZE_FLAC_24) > 0
+              ? 'HI_RES_LOSSLESS'
+              : 'LOSSLESS',
         artworkURL: artwork,
       };
     });
@@ -209,6 +218,69 @@ async function getRemoteFileSize(url: string): Promise<number> {
   }
 }
 
+/**
+ * Reads the FLAC STREAMINFO header to learn the real resolution. The first
+ * 2048-byte stripe is Blowfish-encrypted like every stripe at index 0, so it
+ * is decrypted here with the same routine used for playback.
+ */
+async function probeFlacFormat(
+  url: string,
+  trackId: string | number
+): Promise<{ sampleRate: number; bitDepth: number } | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { Range: `bytes=0-${CHUNK_SIZE - 1}` },
+      signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+
+    let encrypted: Buffer;
+    if (res.status === 206) {
+      encrypted = Buffer.from(await res.arrayBuffer());
+    } else if (res.body) {
+      // A CDN that ignored Range would otherwise make us download the track.
+      const reader = res.body.getReader();
+      const parts: Buffer[] = [];
+      let total = 0;
+      while (total < CHUNK_SIZE) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        parts.push(Buffer.from(value));
+        total += value.length;
+      }
+      try {
+        await reader.cancel();
+      } catch {
+        // Stream already closed.
+      }
+      encrypted = Buffer.concat(parts).subarray(0, CHUNK_SIZE);
+    } else {
+      return null;
+    }
+
+    if (encrypted.length < 42) return null;
+
+    const head = decryptDeezerBuffer(encrypted, trackId, 0);
+    if (head.subarray(0, 4).toString('ascii') !== 'fLaC') return null;
+
+    let offset = 4;
+    const blockType = head[offset] & 0x7f;
+    const blockLength = (head[offset + 1] << 16) | (head[offset + 2] << 8) | head[offset + 3];
+    if (blockType !== 0 || blockLength < 34 || head.length < offset + 4 + 34) return null;
+
+    offset += 4;
+    const info = head.subarray(offset + 10, offset + 18);
+    const sampleRate = (info[0] << 12) | (info[1] << 4) | (info[2] >> 4);
+    const bitDepth = (((info[2] & 1) << 4) | (info[3] >> 4)) + 1;
+
+    if (!sampleRate || !bitDepth) return null;
+    return { sampleRate, bitDepth };
+  } catch {
+    return null;
+  }
+}
+
 async function resolveTrackStreamInfo(
   numericTrackId: string | number,
   quality: 'lossless' | 'high'
@@ -236,6 +308,7 @@ async function resolveTrackStreamInfo(
           { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
         ]
       : [
+          { cipher: 'BF_CBC_STRIPE', format: 'FLAC_24' },
           { cipher: 'BF_CBC_STRIPE', format: 'FLAC' },
           { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
           { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
@@ -294,7 +367,16 @@ async function resolveTrackStreamInfo(
     fileSize = await getRemoteFileSize(streamUrl);
   }
 
-  return { url: streamUrl, format: resolvedFormat, fileSize };
+  const lossless = resolvedFormat === 'FLAC' || resolvedFormat === 'FLAC_24';
+  const defaults =
+    resolvedFormat === 'FLAC_24'
+      ? { sampleRate: 44100, bitDepth: 24 }
+      : { sampleRate: 44100, bitDepth: 16 };
+  const resolution = lossless
+    ? (await probeFlacFormat(streamUrl, numericTrackId)) ?? defaults
+    : defaults;
+
+  return { url: streamUrl, format: resolvedFormat, fileSize, ...resolution };
 }
 
 /**

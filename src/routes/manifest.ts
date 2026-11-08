@@ -17,7 +17,7 @@ export function getManifest(_req: Request, res: Response) {
         type: 'select',
         default: 'lossless',
         options: [
-          { label: 'Lossless (FLAC 16-bit/44.1kHz)', value: 'lossless' },
+          { label: 'Lossless / Hi-Res (FLAC up to 24-bit)', value: 'lossless' },
           { label: 'High (320kbps MP3)', value: 'high' },
         ],
       },

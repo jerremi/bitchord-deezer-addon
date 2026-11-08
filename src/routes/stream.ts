@@ -73,8 +73,10 @@ export async function handleStream(req: Request, res: Response) {
   const t0 = Date.now();
 
   try {
-    const { format } = await getTrackStreamInfo(numericId, quality);
-    const lossless = format.toUpperCase() === 'FLAC';
+    const { format, sampleRate, bitDepth } = await getTrackStreamInfo(numericId, quality);
+    const normalizedFormat = format.toUpperCase();
+    const lossless = normalizedFormat === 'FLAC' || normalizedFormat === 'FLAC_24';
+    const hiRes = normalizedFormat === 'FLAC_24';
     const codec = lossless ? 'flac' : 'mp3';
     const host = req.get('x-forwarded-host') || req.get('host') || 'localhost';
     const url = `${req.protocol}://${host}/audio/${numericId}?quality=${quality}`;
@@ -85,13 +87,17 @@ export async function handleStream(req: Request, res: Response) {
       format: codec,
       codec,
       container: codec,
-      quality: lossless ? 'Lossless' : 'High (320 kbps)',
-      sampleRate: 44100,
-      ...(lossless ? { bitDepth: 16, bitrate: 1_411_000 } : { bitrate: 320_000 }),
+      quality: hiRes ? 'Hi-Res Lossless' : lossless ? 'Lossless' : 'High (320 kbps)',
+      sampleRate,
+      ...(lossless
+        ? { bitDepth, bitrate: sampleRate * bitDepth * 2 }
+        : { bitrate: 320_000 }),
       encrypted: false,
     });
 
-    console.log(`[STREAM] JSON ${numericId} | ${quality} | ${Date.now() - t0}ms`);
+    console.log(
+      `[STREAM] JSON ${numericId} | ${quality} | ${format} ${bitDepth}-bit/${sampleRate} Hz | ${Date.now() - t0}ms`
+    );
   } catch (error: any) {
     const message = error?.message || String(error);
     console.error(`[STREAM] resolve failed ${numericId} | ${Date.now() - t0}ms | ${message}`);
@@ -123,7 +129,9 @@ export async function handleAudio(req: Request, res: Response) {
 
   try {
     const { url: cdnUrl, format, fileSize } = await getTrackStreamInfo(numericId, quality);
-    const contentType = format.toUpperCase() === 'FLAC' ? 'audio/flac' : 'audio/mpeg';
+    const normalizedFormat = format.toUpperCase();
+    const contentType =
+      normalizedFormat === 'FLAC' || normalizedFormat === 'FLAC_24' ? 'audio/flac' : 'audio/mpeg';
     const range = parseRange(req.headers.range, fileSize);
 
     if (range === 'invalid') {
