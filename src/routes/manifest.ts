@@ -10,7 +10,7 @@ export function getManifest(_req: Request, res: Response) {
     resources: ['search', 'stream'],
     bitchordAuth: config.bitchordAuth,
     allowDownloads: 1,
-    checkValidLossless: 1,
+    checkValidLossless: 0,
     settings: [
       {
         key: 'quality',
@@ -25,6 +25,6 @@ export function getManifest(_req: Request, res: Response) {
   };
 
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Cache-Control', 'no-cache');
   res.json(manifest);
 }

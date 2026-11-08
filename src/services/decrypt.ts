@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
-import { Blowfish } from 'egoroof-blowfish';
+import pkg from 'egoroof-blowfish';
+
+const Blowfish: any = (pkg as any).Blowfish || pkg;
 
 const DEEZER_BLOWFISH_SECRET = 'g4el58wc0zvf9na1';
 const DEEZER_IV = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);

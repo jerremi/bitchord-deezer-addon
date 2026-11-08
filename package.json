@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "tunnel": "cloudflared tunnel --url http://localhost:3000",
+    "dev:tunnel": "concurrently -n \"SERVER,TUNNEL\" -c \"blue,green\" \"tsx watch src/index.ts\" \"cloudflared tunnel --url http://localhost:3000\"",
+    "start:tunnel": "concurrently -n \"SERVER,TUNNEL\" -c \"blue,green\" \"node dist/index.js\" \"cloudflared tunnel --url http://localhost:3000\""
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -19,6 +22,7 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.9",
+    "concurrently": "^10.0.7",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }
