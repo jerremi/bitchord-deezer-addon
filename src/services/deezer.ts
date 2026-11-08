@@ -299,7 +299,10 @@ async function resolveTrackStreamInfo(
     throw new Error(`Could not find track data for ID ${numericTrackId}`);
   }
 
-  // 2. Format priority based on quality preference
+  // 2. Format priority based on quality preference. Lossless means lossless:
+  //    when Deezer has neither 24-bit nor 16-bit FLAC, this returns no stream
+  //    so BitChord can fall back to another source (including one offering
+  //    Dolby Atmos) instead of silently playing a 320kbps transcode.
   const formatsToRequest =
     quality === 'high'
       ? [
@@ -310,8 +313,6 @@ async function resolveTrackStreamInfo(
       : [
           { cipher: 'BF_CBC_STRIPE', format: 'FLAC_24' },
           { cipher: 'BF_CBC_STRIPE', format: 'FLAC' },
-          { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
-          { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
         ];
 
   // 3. Request direct CDN stream URL from media.deezer.com
@@ -358,7 +359,11 @@ async function resolveTrackStreamInfo(
   const resolvedFormat = media?.format || formatsToRequest[0].format;
 
   if (!streamUrl) {
-    throw new Error('No stream URL returned by Deezer CDN');
+    throw new Error(
+      quality === 'lossless'
+        ? 'No lossless stream available for this track'
+        : 'No stream URL returned by Deezer CDN'
+    );
   }
 
   const sizeField = FILE_SIZE_FIELDS[resolvedFormat];
