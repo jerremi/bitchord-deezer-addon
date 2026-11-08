@@ -1,109 +1,178 @@
 import type { Request, Response } from 'express';
 import { getTrackStreamInfo } from '../services/deezer.js';
-import { streamAndDecryptDeezer, CHUNK_SIZE } from '../services/decrypt.js';
+import { CHUNK_SIZE, streamAndDecryptDeezer } from '../services/decrypt.js';
+
+type ParsedRange = { start: number; end: number } | 'invalid' | null;
+
+/**
+ * Parses a single-range `bytes=` header. Multi-range requests are rejected,
+ * which is fine: audio players only ever ask for one contiguous range.
+ */
+function parseRange(header: string | undefined, fileSize: number): ParsedRange {
+  if (!header) return null;
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return 'invalid';
+
+  const [, rawStart, rawEnd] = match;
+  if ((!rawStart && !rawEnd) || fileSize <= 0) return 'invalid';
+
+  let start: number;
+  let end: number;
+
+  if (!rawStart) {
+    // Suffix range: bytes=-500 (last 500 bytes)
+    const suffixLength = Number(rawEnd);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return 'invalid';
+    start = Math.max(0, fileSize - suffixLength);
+    end = fileSize - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd ? Number(rawEnd) : fileSize - 1;
+
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) {
+      return 'invalid';
+    }
+    if (start >= fileSize) return 'invalid';
+    if (end >= fileSize) end = fileSize - 1;
+  }
+
+  return { start, end };
+}
 
 export async function handleStream(req: Request, res: Response) {
+  req.socket?.setNoDelay(true);
+
   const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id || '';
   const numericId = String(rawId).replace(/^deezer:/i, '');
-  const quality = (req.query.quality as string) || 'lossless';
+  const quality = req.query.quality === 'high' ? 'high' : 'lossless';
+  const t0 = Date.now();
 
-  if (!numericId) {
-    res.status(400).send('Missing track ID');
+  if (!/^\d+$/.test(numericId)) {
+    res.status(400).send('Invalid track ID');
     return;
   }
 
   try {
-    const { url: cdnUrl, format } = await getTrackStreamInfo(numericId, quality);
+    const { url: cdnUrl, format, fileSize } = await getTrackStreamInfo(numericId, quality);
     const contentType = format.toUpperCase() === 'FLAC' ? 'audio/flac' : 'audio/mpeg';
+    const range = parseRange(req.headers.range, fileSize);
 
-    const rangeHeader = req.headers.range;
+    if (range === 'invalid') {
+      res
+        .status(416)
+        .set('Content-Range', `bytes */${fileSize || '*'}`)
+        .send('Range not satisfiable');
+      return;
+    }
 
-    if (!rangeHeader) {
-      // 1. Full stream request
+    // HEAD only needs metadata; never download audio for it.
+    if (req.method === 'HEAD') {
+      if (range) {
+        res.writeHead(206, {
+          'Content-Type': contentType,
+          'Content-Range': `bytes ${range.start}-${range.end}/${fileSize}`,
+          'Content-Length': range.end - range.start + 1,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'public, max-age=86400',
+        });
+      } else {
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          ...(fileSize > 0 ? { 'Content-Length': fileSize } : {}),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'public, max-age=86400',
+        });
+      }
+      res.end();
+      console.log(`[STREAM] HEAD ${numericId} | ${Date.now() - t0}ms | ${fileSize} bytes`);
+      return;
+    }
+
+    if (!range) {
+      // Full file: stream progressively so playback can start immediately.
       const cdnRes = await fetch(cdnUrl);
       if (!cdnRes.ok || !cdnRes.body) {
-        res.status(cdnRes.status).send(`CDN error: ${cdnRes.statusText}`);
+        console.error(`[STREAM] CDN full failed ${numericId}: HTTP ${cdnRes.status}`);
+        res.status(502).send('Upstream stream unavailable');
         return;
       }
 
-      const totalSize = cdnRes.headers.get('content-length') || '*';
+      const totalSize =
+        Number(cdnRes.headers.get('content-length')) || fileSize;
+      const totalLength = totalSize > 0 ? totalSize : 0;
 
       res.writeHead(200, {
         'Content-Type': contentType,
-        ...(totalSize !== '*' ? { 'Content-Length': totalSize } : {}),
+        ...(totalLength > 0 ? { 'Content-Length': totalLength } : {}),
         'Accept-Ranges': 'bytes',
         'Cache-Control': 'public, max-age=86400',
       });
 
-      await streamAndDecryptDeezer(cdnRes.body, numericId, 0, 0, undefined, res);
+      console.log(
+        `[STREAM] 200 ${numericId} | ${Date.now() - t0}ms | ${totalLength || 'unknown'} bytes`
+      );
+
+      await streamAndDecryptDeezer(
+        cdnRes.body,
+        numericId,
+        0,
+        0,
+        totalLength > 0 ? totalLength - 1 : undefined,
+        res
+      );
       return;
     }
 
-    // 2. HTTP Range request (ExoPlayer seeking and buffer streaming)
-    const matches = rangeHeader.match(/bytes=(\d+)-(\d*)/);
-    if (!matches) {
-      res.status(416).send('Invalid Range header');
-      return;
-    }
-
-    const start = parseInt(matches[1], 10);
-    const end = matches[2] ? parseInt(matches[2], 10) : undefined;
-
-    // Align to 2048-byte chunks for Blowfish stripe decryption
-    const alignedStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE;
-    const alignedEnd =
-      typeof end === 'number'
-        ? (Math.floor(end / CHUNK_SIZE) + 1) * CHUNK_SIZE - 1
-        : undefined;
-
-    const cdnRange =
-      typeof alignedEnd === 'number'
-        ? `bytes=${alignedStart}-${alignedEnd}`
-        : `bytes=${alignedStart}-`;
+    // Fetch whole 2048-byte stripes that cover the requested range.
+    const alignedStart = Math.floor(range.start / CHUNK_SIZE) * CHUNK_SIZE;
+    const alignedEnd = Math.ceil((range.end + 1) / CHUNK_SIZE) * CHUNK_SIZE - 1;
 
     const cdnRes = await fetch(cdnUrl, {
-      headers: { Range: cdnRange },
+      headers: { Range: `bytes=${alignedStart}-${alignedEnd}` },
     });
 
     if (!cdnRes.ok && cdnRes.status !== 206) {
-      res.status(cdnRes.status).send(`CDN Range error: ${cdnRes.statusText}`);
+      console.error(`[STREAM] CDN range failed ${numericId}: HTTP ${cdnRes.status}`);
+      res.status(502).send('Upstream stream unavailable');
       return;
     }
-
     if (!cdnRes.body) {
-      res.status(500).send('CDN stream body is empty');
+      res.status(502).send('Upstream stream unavailable');
       return;
     }
 
-    // Extract total file size from CDN Content-Range header (e.g. bytes 0-1023/22934004)
-    const cdnContentRange = cdnRes.headers.get('content-range') || '';
-    const totalMatch = cdnContentRange.match(/\/(\d+|\*)/);
-    const totalFileSize = totalMatch ? totalMatch[1] : '*';
-
-    // Calculate response range length
-    const actualEnd =
-      typeof end === 'number'
-        ? end
-        : totalFileSize !== '*'
-          ? parseInt(totalFileSize, 10) - 1
-          : undefined;
-
-    const contentLength =
-      typeof actualEnd === 'number' ? actualEnd - start + 1 : undefined;
+    // If the CDN ignored the Range header the body starts at byte 0.
+    const startOffset = cdnRes.status === 206 ? alignedStart : 0;
 
     res.writeHead(206, {
       'Content-Type': contentType,
-      'Content-Range': `bytes ${start}-${typeof actualEnd === 'number' ? actualEnd : '*'}/${totalFileSize}`,
-      ...(typeof contentLength === 'number' ? { 'Content-Length': contentLength } : {}),
+      'Content-Range': `bytes ${range.start}-${range.end}/${fileSize}`,
+      'Content-Length': range.end - range.start + 1,
       'Accept-Ranges': 'bytes',
       'Cache-Control': 'public, max-age=86400',
     });
 
-    await streamAndDecryptDeezer(cdnRes.body, numericId, alignedStart, start, end, res);
+    console.log(
+      `[STREAM] 206 ${numericId} | ${Date.now() - t0}ms | ${range.start}-${range.end}/${fileSize}`
+    );
+
+    await streamAndDecryptDeezer(
+      cdnRes.body,
+      numericId,
+      startOffset,
+      range.start,
+      range.end,
+      res
+    );
   } catch (error: any) {
-    if (!res.headersSent) {
-      console.error(`Stream error for ID ${numericId}:`, error?.message || error);
-      res.status(500).send(`Failed to stream track: ${error?.message || error}`);
+    console.error(
+      `[STREAM] ERROR ${numericId} | ${Date.now() - t0}ms | ${error?.message || error}`
+    );
+    if (res.headersSent) {
+      res.destroy();
+    } else {
+      res.status(500).send('Failed to stream track');
     }
   }
 }

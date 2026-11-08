@@ -8,19 +8,42 @@ interface DeezerUserData {
   expiresAt: number;
 }
 
-interface StreamCacheEntry {
+export interface StreamInfo {
   url: string;
   format: string;
+  fileSize: number;
+}
+
+interface StreamCacheEntry extends StreamInfo {
   expiresAt: number;
 }
 
+// Deezer exposes the exact encrypted file size in song.getData, so resolving a
+// stream URL never needs an extra HEAD round-trip.
+const FILE_SIZE_FIELDS: Record<string, string> = {
+  FLAC: 'FILESIZE_FLAC',
+  MP3_320: 'FILESIZE_MP3_320',
+  MP3_256: 'FILESIZE_MP3_256',
+  MP3_128: 'FILESIZE_MP3_128',
+  MP3_64: 'FILESIZE_MP3_64',
+  AAC_64: 'FILESIZE_AAC_64',
+};
+
+const METADATA_TIMEOUT_MS = 15_000;
+
 let cachedUserData: DeezerUserData | null = null;
-const streamUrlCache = new Map<string, StreamCacheEntry>();
+let userDataPromise: Promise<DeezerUserData> | null = null;
+const streamInfoCache = new Map<string, StreamCacheEntry>();
+const streamInfoInflight = new Map<string, Promise<StreamInfo>>();
 
 const GW_LIGHT_URL = 'https://www.deezer.com/ajax/gw-light.php';
 const MEDIA_URL = 'https://media.deezer.com/v1/get_url';
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+
+function normalizeQuality(quality: string): 'lossless' | 'high' {
+  return quality === 'high' ? 'high' : 'lossless';
+}
 
 /**
  * Calls Deezer's internal gw-light.php gateway.
@@ -53,6 +76,7 @@ async function callGateway(
       'User-Agent': USER_AGENT,
     },
     body: JSON.stringify(params),
+    signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -73,44 +97,54 @@ async function callGateway(
 
 /**
  * Retrieves and caches the session checkForm, sessionId, and licenseToken.
+ * Concurrent callers share one in-flight request.
  */
 async function getUserData(): Promise<DeezerUserData> {
   const now = Date.now();
   if (cachedUserData && cachedUserData.expiresAt > now) {
     return cachedUserData;
   }
+  if (userDataPromise) return userDataPromise;
 
-  const results = await callGateway('deezer.getUserData', {});
-  if (!results) {
-    throw new Error('Failed to retrieve Deezer user data. Check your DEEZER_ARL.');
-  }
+  userDataPromise = (async () => {
+    const results = await callGateway('deezer.getUserData', {});
+    if (!results) {
+      throw new Error('Failed to retrieve Deezer user data. Check your DEEZER_ARL.');
+    }
 
-  const checkForm = results.checkForm || results.check_form_key || '';
-  const sessionId = results.SESSION_ID || '';
-  const licenseToken =
-    results.USER?.OPTIONS?.license_token || results.USER?.license_token || '';
+    const checkForm = results.checkForm || results.check_form_key || '';
+    const sessionId = results.SESSION_ID || '';
+    const licenseToken =
+      results.USER?.OPTIONS?.license_token || results.USER?.license_token || '';
 
-  if (!licenseToken) {
-    throw new Error(
-      'Could not find license_token in user data. Ensure your ARL belongs to an active Deezer account.'
-    );
-  }
+    if (!licenseToken) {
+      throw new Error(
+        'Could not find license_token in user data. Ensure your ARL belongs to an active Deezer account.'
+      );
+    }
 
-  cachedUserData = {
-    checkForm,
-    sessionId,
-    licenseToken,
-    expiresAt: now + 45 * 60 * 1000, // 45 minutes cache
-  };
+    cachedUserData = {
+      checkForm,
+      sessionId,
+      licenseToken,
+      expiresAt: Date.now() + 45 * 60 * 1000,
+    };
 
-  return cachedUserData;
+    return cachedUserData;
+  })().finally(() => {
+    userDataPromise = null;
+  });
+
+  return userDataPromise;
 }
 
 /**
  * Searches Deezer catalog using the authenticated gateway API.
+ * Top results are pre-resolved in the background to minimize /stream latency.
  */
-export async function searchTracks(query: string, _quality = 'lossless'): Promise<BitChordTrack[]> {
+export async function searchTracks(query: string, quality = 'lossless'): Promise<BitChordTrack[]> {
   try {
+    const normalizedQuality = normalizeQuality(quality);
     const { checkForm, sessionId } = await getUserData();
     const results = await callGateway(
       'search.music',
@@ -125,11 +159,11 @@ export async function searchTracks(query: string, _quality = 'lossless'): Promis
     );
 
     const items = results?.data;
-    if (!items || !Array.isArray(items)) {
+    if (!Array.isArray(items)) {
       return [];
     }
 
-    return items.map((item: any) => {
+    const tracks: BitChordTrack[] = items.map((item: any) => {
       const artId = item.ALB_PICTURE;
       const artwork = artId
         ? `https://e-cdns-images.dzcdn.net/images/cover/${artId}/500x500-000000-80-0-0.jpg`
@@ -141,33 +175,46 @@ export async function searchTracks(query: string, _quality = 'lossless'): Promis
         artist: item.ART_NAME,
         album: item.ALB_TITLE,
         duration: Math.round(Number(item.DURATION) || 0),
-        format: 'flac', // Deezer Premium FLAC 16-bit/44.1kHz
+        format: normalizedQuality === 'high' ? 'mp3' : 'flac',
         artwork,
       };
     });
+
+    // Fire-and-forget URL pre-warm; failures are irrelevant to search results.
+    void Promise.allSettled(
+      tracks
+        .slice(0, 5)
+        .map((track) =>
+          getTrackStreamInfo(track.id.replace(/^deezer:/i, ''), normalizedQuality)
+        )
+    );
+
+    return tracks;
   } catch (error) {
     console.error('Deezer gateway search failed:', error);
     return [];
   }
 }
 
-/**
- * Resolves the raw Deezer CDN stream URL and audio format for a track.
- */
-export async function getTrackStreamInfo(
-  numericTrackId: string | number,
-  preferredQuality = 'lossless'
-): Promise<{ url: string; format: string }> {
-  const cacheKey = `${numericTrackId}:${preferredQuality}`;
-  const now = Date.now();
-  const cached = streamUrlCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) {
-    return { url: cached.url, format: cached.format };
+async function getRemoteFileSize(url: string): Promise<number> {
+  try {
+    const res = await fetch(url, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
+    });
+    return Number(res.headers.get('content-length')) || 0;
+  } catch {
+    return 0;
   }
+}
 
+async function resolveTrackStreamInfo(
+  numericTrackId: string | number,
+  quality: 'lossless' | 'high'
+): Promise<StreamInfo> {
   const { checkForm, sessionId, licenseToken } = await getUserData();
 
-  // 1. Fetch track metadata & track_token
+  // 1. Track metadata & track_token
   const songData = await callGateway(
     'song.getData',
     { sng_id: numericTrackId },
@@ -175,15 +222,13 @@ export async function getTrackStreamInfo(
     sessionId
   );
 
-  if (!songData || !songData.TRACK_TOKEN) {
+  if (!songData?.TRACK_TOKEN) {
     throw new Error(`Could not find track data for ID ${numericTrackId}`);
   }
 
-  const trackToken = songData.TRACK_TOKEN;
-
   // 2. Format priority based on quality preference
   const formatsToRequest =
-    preferredQuality === 'high'
+    quality === 'high'
       ? [
           { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
           { cipher: 'BF_CBC_STRIPE', format: 'FLAC' },
@@ -210,8 +255,9 @@ export async function getTrackStreamInfo(
           formats: formatsToRequest,
         },
       ],
-      track_tokens: [trackToken],
+      track_tokens: [songData.TRACK_TOKEN],
     }),
+    signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
   });
 
   if (!mediaRes.ok) {
@@ -235,21 +281,54 @@ export async function getTrackStreamInfo(
 
   const media = trackData?.media?.[0];
   const streamUrl = media?.sources?.[0]?.url;
-  const resolvedFormat = media?.format || 'FLAC';
+  const resolvedFormat = media?.format || formatsToRequest[0].format;
 
   if (!streamUrl) {
     throw new Error('No stream URL returned by Deezer CDN');
   }
 
-  const result = {
-    url: streamUrl,
-    format: resolvedFormat,
-  };
+  const sizeField = FILE_SIZE_FIELDS[resolvedFormat];
+  let fileSize = Number(sizeField ? songData[sizeField] : 0) || 0;
+  if (!fileSize) {
+    fileSize = await getRemoteFileSize(streamUrl);
+  }
 
-  streamUrlCache.set(cacheKey, {
-    ...result,
-    expiresAt: now + 15 * 60 * 1000, // 15 min cache
-  });
+  return { url: streamUrl, format: resolvedFormat, fileSize };
+}
 
-  return result;
+/**
+ * Resolves the raw Deezer CDN stream URL, audio format, and file size.
+ * Results (and concurrent requests for the same track) are cached for 15 min.
+ */
+export function getTrackStreamInfo(
+  numericTrackId: string | number,
+  preferredQuality = 'lossless'
+): Promise<StreamInfo> {
+  const quality = normalizeQuality(preferredQuality);
+  const cacheKey = `${numericTrackId}:${quality}`;
+  const now = Date.now();
+
+  const cached = streamInfoCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return Promise.resolve(cached);
+  }
+  if (cached) streamInfoCache.delete(cacheKey);
+
+  const inflight = streamInfoInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = resolveTrackStreamInfo(numericTrackId, quality)
+    .then((info) => {
+      streamInfoCache.set(cacheKey, {
+        ...info,
+        expiresAt: Date.now() + 15 * 60 * 1000,
+      });
+      return info;
+    })
+    .finally(() => {
+      streamInfoInflight.delete(cacheKey);
+    });
+
+  streamInfoInflight.set(cacheKey, promise);
+  return promise;
 }

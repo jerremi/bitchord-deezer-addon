@@ -27,33 +27,50 @@ export function getBlowfishKey(trackId: string | number): Buffer {
   return key;
 }
 
+function createBlowfish(trackId: string | number): any {
+  return new Blowfish(getBlowfishKey(trackId), Blowfish.MODE.CBC, Blowfish.PADDING.NULL);
+}
+
 /**
- * Decrypts a full buffer synchronously (useful for small range queries).
+ * Decrypts one 2048-byte stripe. NULL padding strips trailing 0x00 bytes while
+ * decoding, so they are restored to keep output length identical to the input.
+ * Otherwise the byte stream shifts and the player receives corrupt audio.
+ */
+function decryptChunk(bf: any, chunk: Buffer): Buffer {
+  bf.setIv(DEEZER_IV);
+  const raw = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
+  if (raw.length === chunk.length) return raw;
+
+  const restored = Buffer.alloc(chunk.length);
+  raw.copy(restored);
+  return restored;
+}
+
+function decryptChunkSafe(bf: any, chunk: Buffer): Buffer {
+  try {
+    return decryptChunk(bf, chunk);
+  } catch {
+    return chunk;
+  }
+}
+
+/**
+ * Decrypts a full buffer synchronously (useful for tests and small ranges).
  */
 export function decryptDeezerBuffer(
   buffer: Buffer,
   trackId: string | number,
   startOffset: number = 0
 ): Buffer {
-  const key = getBlowfishKey(trackId);
-  const bf = new Blowfish(key, Blowfish.MODE.CBC, Blowfish.PADDING.NULL);
-
+  const bf = createBlowfish(trackId);
   const decryptedChunks: Buffer[] = [];
-  const totalLength = buffer.length;
 
-  for (let pos = 0; pos < totalLength; pos += CHUNK_SIZE) {
-    const chunkLength = Math.min(CHUNK_SIZE, totalLength - pos);
-    const chunk = buffer.subarray(pos, pos + chunkLength);
+  for (let pos = 0; pos < buffer.length; pos += CHUNK_SIZE) {
+    const chunk = buffer.subarray(pos, Math.min(pos + CHUNK_SIZE, buffer.length));
     const absoluteChunkIndex = Math.floor((startOffset + pos) / CHUNK_SIZE);
 
-    if (absoluteChunkIndex % 3 === 0 && chunkLength === CHUNK_SIZE) {
-      try {
-        bf.setIv(DEEZER_IV);
-        const decrypted = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
-        decryptedChunks.push(decrypted);
-      } catch {
-        decryptedChunks.push(chunk);
-      }
+    if (absoluteChunkIndex % 3 === 0 && chunk.length === CHUNK_SIZE) {
+      decryptedChunks.push(decryptChunkSafe(bf, chunk));
     } else {
       decryptedChunks.push(chunk);
     }
@@ -63,7 +80,9 @@ export function decryptDeezerBuffer(
 }
 
 /**
- * Streams and decrypts Deezer CDN audio chunk-by-chunk with instant TTFB (~30ms).
+ * Streams and decrypts Deezer CDN audio chunk-by-chunk with instant TTFB.
+ * The CDN range must start on a 2048-byte boundary; `startOffset` is that
+ * boundary so Blowfish stripe indexes stay aligned with the source file.
  */
 export async function streamAndDecryptDeezer(
   stream: ReadableStream<Uint8Array>,
@@ -73,100 +92,121 @@ export async function streamAndDecryptDeezer(
   requestedEnd: number | undefined,
   res: Response
 ): Promise<void> {
-  const key = getBlowfishKey(trackId);
-  const bf = new Blowfish(key, Blowfish.MODE.CBC, Blowfish.PADDING.NULL);
-
-  let currentBuffer = Buffer.alloc(0);
-  let absolutePos = startOffset;
-  let bytesWritten = 0;
-  const maxBytesToWrite =
-    typeof requestedEnd === 'number' ? requestedEnd - requestedStart + 1 : undefined;
-
+  const bf = createBlowfish(trackId);
   const reader = stream.getReader();
 
+  let pending = Buffer.alloc(0);
+  let absolutePos = startOffset;
+  let aborted = false;
+
+  const cancelReader = async () => {
+    try {
+      await reader.cancel();
+    } catch {
+      // Stream already closed.
+    }
+  };
+
+  const onClose = () => {
+    aborted = true;
+    void cancelReader();
+  };
+  res.once('close', onClose);
+
+  /**
+   * Writes a slice and waits for 'drain' when the socket is saturated, so a
+   * slow client cannot make the server buffer a whole track in memory.
+   */
+  const write = async (data: Buffer): Promise<boolean> => {
+    if (data.length === 0) return true;
+    if (aborted || res.destroyed || res.writableEnded) return false;
+
+    if (res.write(data)) return true;
+
+    return new Promise<boolean>((resolve) => {
+      const cleanup = () => {
+        res.off('drain', onDrain);
+        res.off('close', onDrainClose);
+        res.off('error', onDrainClose);
+      };
+      const onDrain = () => {
+        cleanup();
+        resolve(true);
+      };
+      const onDrainClose = () => {
+        cleanup();
+        aborted = true;
+        resolve(false);
+      };
+      res.once('drain', onDrain);
+      res.once('close', onDrainClose);
+      res.once('error', onDrainClose);
+    });
+  };
+
   try {
-    while (true) {
+    while (!aborted) {
       const { done, value } = await reader.read();
+      if (done) break;
 
-      if (done) {
-        if (currentBuffer.length > 0) {
-          const chunkLen = currentBuffer.length;
-          const chunkIndex = Math.floor(absolutePos / CHUNK_SIZE);
-          let chunk = currentBuffer;
+      const incoming = Buffer.from(value);
+      pending = pending.length === 0 ? incoming : Buffer.concat([pending, incoming]);
 
-          if (chunkIndex % 3 === 0 && chunkLen === CHUNK_SIZE) {
-            try {
-              bf.setIv(DEEZER_IV);
-              chunk = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
-            } catch {
-              // Ignore decrypt error on partial
-            }
-          }
-
-          const sliceStart = Math.max(0, requestedStart - absolutePos);
-          if (sliceStart < chunk.length) {
-            let slice = chunk.subarray(sliceStart);
-            if (typeof maxBytesToWrite === 'number') {
-              const remaining = maxBytesToWrite - bytesWritten;
-              if (slice.length > remaining) slice = slice.subarray(0, remaining);
-            }
-            if (slice.length > 0) {
-              res.write(slice);
-              bytesWritten += slice.length;
-            }
-          }
-        }
-        break;
-      }
-
-      currentBuffer = Buffer.concat([currentBuffer, Buffer.from(value)]);
-
-      while (currentBuffer.length >= CHUNK_SIZE) {
-        const chunk = currentBuffer.subarray(0, CHUNK_SIZE);
-        currentBuffer = currentBuffer.subarray(CHUNK_SIZE);
+      while (pending.length >= CHUNK_SIZE) {
+        const chunk = pending.subarray(0, CHUNK_SIZE);
+        pending = pending.subarray(CHUNK_SIZE);
 
         const chunkIndex = Math.floor(absolutePos / CHUNK_SIZE);
-        let decrypted = chunk;
+        const decrypted =
+          chunkIndex % 3 === 0 ? decryptChunkSafe(bf, chunk) : chunk;
 
-        if (chunkIndex % 3 === 0) {
-          try {
-            bf.setIv(DEEZER_IV);
-            decrypted = Buffer.from(bf.decode(chunk, Blowfish.TYPE.UINT8_ARRAY));
-          } catch {
-            // Fallback to unencrypted
-          }
-        }
+        const sliceFrom = Math.max(0, requestedStart - absolutePos);
+        const sliceTo =
+          requestedEnd !== undefined
+            ? Math.min(CHUNK_SIZE, requestedEnd - absolutePos + 1)
+            : CHUNK_SIZE;
 
-        const chunkEnd = absolutePos + CHUNK_SIZE - 1;
-
-        if (chunkEnd >= requestedStart) {
-          const sliceStart = Math.max(0, requestedStart - absolutePos);
-          let slice = decrypted.subarray(sliceStart);
-
-          if (typeof maxBytesToWrite === 'number') {
-            const remaining = maxBytesToWrite - bytesWritten;
-            if (slice.length > remaining) {
-              slice = slice.subarray(0, remaining);
-            }
-          }
-
-          if (slice.length > 0) {
-            res.write(slice);
-            bytesWritten += slice.length;
-          }
-
-          if (typeof maxBytesToWrite === 'number' && bytesWritten >= maxBytesToWrite) {
-            await reader.cancel();
-            res.end();
-            return;
-          }
+        if (sliceTo > sliceFrom && !(await write(decrypted.subarray(sliceFrom, sliceTo)))) {
+          break;
         }
 
         absolutePos += CHUNK_SIZE;
+
+        if (requestedEnd !== undefined && absolutePos > requestedEnd) {
+          await cancelReader();
+          if (!aborted) res.end();
+          return;
+        }
       }
     }
+
+    if (!aborted) {
+      // A trailing partial chunk is never encrypted.
+      const sliceFrom = Math.max(0, requestedStart - absolutePos);
+      const sliceTo =
+        requestedEnd !== undefined
+          ? Math.min(pending.length, requestedEnd - absolutePos + 1)
+          : pending.length;
+
+      if (sliceTo > sliceFrom) {
+        await write(pending.subarray(sliceFrom, sliceTo));
+      }
+    }
+
+    if (aborted) {
+      await cancelReader();
+      return;
+    }
+
     res.end();
-  } catch {
-    res.end();
+  } catch (error) {
+    await cancelReader();
+    if (aborted) {
+      if (!res.writableEnded) res.destroy();
+      return;
+    }
+    throw error;
+  } finally {
+    res.off('close', onClose);
   }
 }
